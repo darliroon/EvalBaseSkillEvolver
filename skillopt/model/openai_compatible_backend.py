@@ -1,0 +1,537 @@
+"""Generic OpenAI-compatible chat backend for optimizer and target paths.
+
+This backend talks to *any* service that exposes an OpenAI-compatible
+``/chat/completions`` endpoint through the official ``openai`` SDK. A single
+implementation therefore covers a large family of providers, for example:
+
+* DeepSeek           (``https://api.deepseek.com``)
+* Groq               (``https://api.groq.com/openai/v1``)
+* Together AI        (``https://api.together.xyz/v1``)
+* Mistral / Fireworks / OpenRouter / Perplexity / xAI Grok
+* Ollama             (``http://localhost:11434/v1``)
+* vLLM / SGLang / TGI self-hosted servers
+* LiteLLM proxy      (``http://localhost:4000``)
+* Azure OpenAI and OpenAI itself
+
+Unlike the Azure backend it never assumes Azure-specific auth or the Responses
+API — it only needs a ``base_url`` and an ``api_key`` (some local servers accept
+any key, so the key is optional and falls back to a harmless placeholder).
+
+The module mirrors the callable surface of the other chat backends
+(:mod:`skillopt.model.qwen_backend`, :mod:`skillopt.model.minimax_backend`) so
+it can be selected as the optimizer and/or target backend and routed through
+:mod:`skillopt.model`.
+"""
+from __future__ import annotations
+
+import itertools
+import os
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from openai import OpenAI
+
+from skillopt.model.common import (
+    TokenTracker,
+    compat_message_from_chat_message,
+    default_model_for_backend,
+    usage_from_openai_usage,
+)
+
+BACKEND_NAME = "openai_compatible"
+
+
+@dataclass
+class OpenAICompatibleConfig:
+    base_url: str
+    api_key: str
+    deployment: str
+    timeout_seconds: float
+    max_tokens: int
+    temperature: float | None
+
+
+def _parse_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    return float(raw) if raw else None
+
+
+def _parse_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    raw = str(value).strip()
+    return int(raw) if raw else default
+
+
+def _role_env(role: str, key: str, default: str) -> str:
+    """Resolve a config value, preferring role-specific over shared env vars."""
+    role_key = f"{role.upper()}_OPENAI_COMPATIBLE_{key}"
+    generic_key = f"OPENAI_COMPATIBLE_{key}"
+    return os.environ.get(role_key) or os.environ.get(generic_key) or default
+
+
+def _initial_config(role: str) -> OpenAICompatibleConfig:
+    role_upper = role.upper()
+    deployment_env = "OPTIMIZER_DEPLOYMENT" if role == "optimizer" else "TARGET_DEPLOYMENT"
+    return OpenAICompatibleConfig(
+        base_url=_role_env(role, "BASE_URL", ""),
+        api_key=_role_env(role, "API_KEY", ""),
+        deployment=(
+            os.environ.get(f"{role_upper}_OPENAI_COMPATIBLE_MODEL")
+            or os.environ.get("OPENAI_COMPATIBLE_MODEL")
+            or os.environ.get(deployment_env)
+            or "GLM-5.2"
+        ),
+        timeout_seconds=float(_role_env(role, "TIMEOUT_SECONDS", "300") or 300),
+        max_tokens=_parse_int(_role_env(role, "MAX_TOKENS", "0"), 0),
+        temperature=_parse_optional_float(_role_env(role, "TEMPERATURE", "")),
+    )
+
+
+OPTIMIZER_CONFIG = _initial_config("optimizer")
+TARGET_CONFIG = _initial_config("target")
+
+_config_lock = threading.Lock()
+_client_lock = threading.Lock()
+tracker = TokenTracker()
+
+_optimizer_client: OpenAI | None = None
+_target_client: OpenAI | None = None
+
+# Multi-key round-robin pool: when the configured api_key contains commas
+# (e.g. "sk-key1,sk-key2,sk-key3"), we build one client per key and rotate
+# across calls.  This spreads load when a single key has RPM/TPM limits.
+# When deployment (model name) also contains commas, each key is paired with
+# its corresponding model (e.g. "GLM-5.2,GLM-5.1" + "key1,key2" → key1→GLM-5.2,
+# key2→GLM-5.1), distributing load across multiple model deployments.
+_optimizer_clients: list[OpenAI] = []
+_target_clients: list[OpenAI] = []
+_optimizer_deployments: list[str] = []
+_target_deployments: list[str] = []
+_optimizer_cycle: itertools.cycle | None = None
+_target_cycle: itertools.cycle | None = None
+_optimizer_deployment_cycle: itertools.cycle | None = None
+_target_deployment_cycle: itertools.cycle | None = None
+_cycle_lock = threading.Lock()
+
+
+def _config_for(role: str) -> OpenAICompatibleConfig:
+    return OPTIMIZER_CONFIG if role == "optimizer" else TARGET_CONFIG
+
+
+def _parse_keys(raw: str) -> list[str]:
+    """Parse comma-separated API keys into a de-duplicated list."""
+    seen: list[str] = []
+    for k in raw.split(","):
+        k = k.strip()
+        if k and k not in seen:
+            seen.append(k)
+    return seen
+
+
+def _build_clients(
+    config: OpenAICompatibleConfig,
+) -> tuple[list[OpenAI], list[str]]:
+    """Build one client per API key for round-robin load balancing.
+
+    Returns (clients, deployments) where deployments[i] is the model name
+    paired with clients[i].  When deployment contains commas (e.g.
+    "GLM-5.2,GLM-5.1"), each key gets its own model; otherwise all keys
+    share the single deployment name.
+    """
+    base_url = config.base_url.rstrip("/")
+    if not base_url:
+        raise ValueError(
+            "OpenAI-compatible base_url is not configured — "
+            "set openai_compatible_base_url (or optimizer/target-specific) in config"
+        )
+    keys = _parse_keys(config.api_key) if config.api_key else []
+    if not keys:
+        keys = ["dummy"]
+    deployments = _parse_keys(config.deployment) if config.deployment else []
+    if not deployments:
+        deployments = [config.deployment or ""]
+    # Replicate the shorter list to match the longer one
+    n = max(len(keys), len(deployments))
+    keys = (keys * ((n // len(keys)) + 1))[:n]
+    deployments = (deployments * ((n // len(deployments)) + 1))[:n]
+    clients = [
+        OpenAI(base_url=base_url, api_key=k, timeout=config.timeout_seconds)
+        for k in keys
+    ]
+    return clients, deployments
+
+
+def _ensure_clients(role: str) -> None:
+    """Lazily build the client pool (one client per key)."""
+    global _optimizer_clients, _target_clients
+    global _optimizer_deployments, _target_deployments
+    global _optimizer_cycle, _target_cycle
+    global _optimizer_deployment_cycle, _target_deployment_cycle
+    with _cycle_lock:
+        if role == "optimizer" and not _optimizer_clients:
+            _optimizer_clients, _optimizer_deployments = _build_clients(OPTIMIZER_CONFIG)
+            _optimizer_cycle = itertools.cycle(_optimizer_clients)
+            _optimizer_deployment_cycle = itertools.cycle(_optimizer_deployments)
+        elif role == "target" and not _target_clients:
+            _target_clients, _target_deployments = _build_clients(TARGET_CONFIG)
+            _target_cycle = itertools.cycle(_target_clients)
+            _target_deployment_cycle = itertools.cycle(_target_deployments)
+
+
+def _get_client(role: str) -> tuple[OpenAI, str]:
+    """Return the next (client, deployment) in the round-robin cycle.
+
+    Falls back to the single-client path when only one key is configured,
+    preserving the original lazy-init behaviour.
+    """
+    _ensure_clients(role)
+    with _cycle_lock:
+        if role == "optimizer":
+            if _optimizer_cycle is not None and _optimizer_deployment_cycle is not None:
+                return next(_optimizer_cycle), next(_optimizer_deployment_cycle)
+        elif _target_cycle is not None and _target_deployment_cycle is not None:
+            return next(_target_cycle), next(_target_deployment_cycle)
+    # Fallback (should not be reached, but keeps the signature safe)
+    _ensure_clients(role)
+    if role == "optimizer":
+        return _optimizer_clients[0], _optimizer_deployments[0] if _optimizer_deployments else OPTIMIZER_CONFIG.deployment
+    return _target_clients[0], _target_deployments[0] if _target_deployments else TARGET_CONFIG.deployment
+
+
+def _reset_clients() -> None:
+    global _optimizer_client, _target_client
+    global _optimizer_clients, _target_clients
+    global _optimizer_deployments, _target_deployments
+    global _optimizer_cycle, _target_cycle
+    global _optimizer_deployment_cycle, _target_deployment_cycle
+    with _client_lock:
+        _optimizer_client = None
+        _target_client = None
+    with _cycle_lock:
+        _optimizer_clients = []
+        _target_clients = []
+        _optimizer_deployments = []
+        _target_deployments = []
+        _optimizer_cycle = None
+        _target_cycle = None
+        _optimizer_deployment_cycle = None
+        _target_deployment_cycle = None
+
+
+def count_tokens(text: str, model: str | None = None) -> int:
+    """Best-effort token count for a string.
+
+    Uses ``tiktoken`` when available (per-model encoding, falling back to the
+    ``cl100k_base`` encoding). If ``tiktoken`` is not installed or fails — which
+    is common for non-OpenAI models served through compatible APIs — it falls
+    back to a character-based estimate of roughly four characters per token.
+    """
+    if not text:
+        return 0
+    try:
+        import tiktoken
+
+        try:
+            encoding = tiktoken.encoding_for_model(model or "gpt-4o")
+        except Exception:  # noqa: BLE001 - unknown/non-OpenAI model name
+            encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except Exception:  # noqa: BLE001 - tiktoken missing or encoding failure
+        # Rough heuristic: ~4 characters per token for English-like text.
+        return max(1, (len(text) + 3) // 4)
+
+
+def _chat_messages_impl(
+    messages: list[dict[str, Any]],
+    max_completion_tokens: int,
+    retries: int,
+    stage: str,
+    *,
+    role: str,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    return_message: bool = False,
+    deployment: str | None = None,
+    timeout: float | None = None,
+) -> tuple[Any, dict[str, int]]:
+    config = _config_for(role)
+    client, pool_deployment = _get_client(role)
+    if max_completion_tokens <= 0:
+        raise ValueError("max_completion_tokens must be set (> 0) — check your config")
+    kwargs: dict[str, Any] = {
+        "model": deployment or pool_deployment or config.deployment,
+        "messages": messages,
+        "max_tokens": max_completion_tokens,
+    }
+    if config.temperature is not None:
+        kwargs["temperature"] = config.temperature
+    if tools:
+        kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            choices = getattr(resp, "choices", None) or []
+            if not choices:
+                raise RuntimeError(
+                    f"OpenAI-compatible API returned no choices: {resp!r}"
+                )
+            message = choices[0].message
+            text = message.content or ""
+            # Reasoning models (e.g. GLM-5.2) may put all output in
+            # reasoning_content when max_tokens is tight, leaving
+            # content empty.  Fall back to reasoning_content so the
+            # analyst/optimizer pipeline can still extract patches.
+            reasoning = getattr(message, "reasoning_content", None) or ""
+            if not text and reasoning:
+                text = reasoning
+            usage_info = usage_from_openai_usage(getattr(resp, "usage", None))
+            tracker.record(
+                stage,
+                usage_info["prompt_tokens"],
+                usage_info["completion_tokens"],
+            )
+            if return_message:
+                return compat_message_from_chat_message(message), usage_info
+            return text, usage_info
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            time.sleep(min(2 ** attempt, 30))
+    raise RuntimeError(
+        f"OpenAI-compatible chat call failed after {retries} retries: {last_err}"
+    )
+
+
+# ── Public API (mirrors the other chat backends) ─────────────────────────────
+
+
+def chat_optimizer(
+    system: str,
+    user: str,
+    max_completion_tokens: int = 0,
+    retries: int = 5,
+    stage: str = "optimizer",
+    reasoning_effort: str | None = None,
+    timeout: float | None = None,
+) -> tuple[str, dict[str, int]]:
+    del reasoning_effort  # not forwarded — kept for a uniform signature
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        role="optimizer",
+        timeout=timeout,
+    )
+
+
+def chat_target(
+    system: str,
+    user: str,
+    max_completion_tokens: int = 0,
+    retries: int = 5,
+    stage: str = "target",
+    reasoning_effort: str | None = None,
+    timeout: float | None = None,
+) -> tuple[str, dict[str, int]]:
+    del reasoning_effort
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        role="target",
+        timeout=timeout,
+    )
+
+
+def chat_optimizer_messages(
+    messages: list[dict[str, Any]],
+    max_completion_tokens: int = 0,
+    retries: int = 5,
+    stage: str = "optimizer",
+    reasoning_effort: str | None = None,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    return_message: bool = False,
+    timeout: float | None = None,
+) -> tuple[Any, dict[str, int]]:
+    del reasoning_effort
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        role="optimizer",
+        tools=tools,
+        tool_choice=tool_choice,
+        return_message=return_message,
+        timeout=timeout,
+    )
+
+
+def chat_target_messages(
+    messages: list[dict[str, Any]],
+    max_completion_tokens: int = 0,
+    retries: int = 5,
+    stage: str = "target",
+    reasoning_effort: str | None = None,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    return_message: bool = False,
+    timeout: float | None = None,
+) -> tuple[Any, dict[str, int]]:
+    del reasoning_effort
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        role="target",
+        tools=tools,
+        tool_choice=tool_choice,
+        return_message=return_message,
+        timeout=timeout,
+    )
+
+
+# ── Configuration / lifecycle ────────────────────────────────────────────────
+
+
+def _update_config(
+    config: OpenAICompatibleConfig,
+    role: str,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    deployment: str | None = None,
+    temperature: float | str | None = None,
+    timeout_seconds: float | str | None = None,
+    max_tokens: int | str | None = None,
+) -> None:
+    env_prefix = role.upper()
+    if base_url is not None:
+        config.base_url = str(base_url).strip() or config.base_url
+        os.environ[f"{env_prefix}_OPENAI_COMPATIBLE_BASE_URL"] = config.base_url
+    if api_key is not None:
+        config.api_key = str(api_key).strip()
+        os.environ[f"{env_prefix}_OPENAI_COMPATIBLE_API_KEY"] = config.api_key
+    if deployment is not None:
+        config.deployment = str(deployment).strip() or config.deployment
+        os.environ[f"{env_prefix}_OPENAI_COMPATIBLE_MODEL"] = config.deployment
+    if temperature is not None:
+        raw = str(temperature).strip()
+        config.temperature = float(raw) if raw else None
+        os.environ[f"{env_prefix}_OPENAI_COMPATIBLE_TEMPERATURE"] = raw
+    if timeout_seconds is not None:
+        config.timeout_seconds = float(timeout_seconds)
+        os.environ[f"{env_prefix}_OPENAI_COMPATIBLE_TIMEOUT_SECONDS"] = str(timeout_seconds)
+    if max_tokens is not None:
+        config.max_tokens = int(max_tokens)
+        os.environ[f"{env_prefix}_OPENAI_COMPATIBLE_MAX_TOKENS"] = str(max_tokens)
+
+
+def configure_openai_compatible(
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    temperature: float | str | None = None,
+    timeout_seconds: float | str | None = None,
+    max_tokens: int | str | None = None,
+    optimizer_base_url: str | None = None,
+    optimizer_api_key: str | None = None,
+    optimizer_model: str | None = None,
+    target_base_url: str | None = None,
+    target_api_key: str | None = None,
+    target_model: str | None = None,
+) -> None:
+    """Configure the generic OpenAI-compatible backend at runtime.
+
+    Shared values apply to both the optimizer and target roles; the
+    ``optimizer_*`` / ``target_*`` variants override them per role.
+    """
+    with _config_lock:
+        if base_url is not None:
+            os.environ["OPENAI_COMPATIBLE_BASE_URL"] = str(base_url).strip()
+        if api_key is not None:
+            os.environ["OPENAI_COMPATIBLE_API_KEY"] = str(api_key).strip()
+        if model is not None:
+            os.environ["OPENAI_COMPATIBLE_MODEL"] = str(model).strip()
+        if temperature is not None:
+            os.environ["OPENAI_COMPATIBLE_TEMPERATURE"] = str(temperature).strip()
+        if timeout_seconds is not None:
+            os.environ["OPENAI_COMPATIBLE_TIMEOUT_SECONDS"] = str(timeout_seconds)
+        if max_tokens is not None:
+            os.environ["OPENAI_COMPATIBLE_MAX_TOKENS"] = str(max_tokens)
+        _update_config(
+            OPTIMIZER_CONFIG,
+            "optimizer",
+            base_url=optimizer_base_url if optimizer_base_url is not None else base_url,
+            api_key=optimizer_api_key if optimizer_api_key is not None else api_key,
+            deployment=optimizer_model if optimizer_model is not None else model,
+            temperature=temperature,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+        )
+        _update_config(
+            TARGET_CONFIG,
+            "target",
+            base_url=target_base_url if target_base_url is not None else base_url,
+            api_key=target_api_key if target_api_key is not None else api_key,
+            deployment=target_model if target_model is not None else model,
+            temperature=temperature,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+        )
+    _reset_clients()
+
+
+def get_max_tokens() -> int:
+    return TARGET_CONFIG.max_tokens
+
+
+def get_token_summary() -> dict[str, dict[str, int]]:
+    return tracker.summary()
+
+
+def reset_token_tracker() -> None:
+    tracker.reset()
+
+
+def set_reasoning_effort(effort: str | None) -> None:
+    # Reasoning effort is provider-specific and not universally supported by
+    # OpenAI-compatible endpoints, so it is intentionally a no-op here.
+    del effort
+
+
+def set_target_deployment(deployment: str) -> None:
+    TARGET_CONFIG.deployment = deployment or default_model_for_backend(BACKEND_NAME)
+    os.environ["TARGET_DEPLOYMENT"] = TARGET_CONFIG.deployment
+    _reset_clients()
+
+
+def set_optimizer_deployment(deployment: str) -> None:
+    OPTIMIZER_CONFIG.deployment = deployment or default_model_for_backend(BACKEND_NAME)
+    os.environ["OPTIMIZER_DEPLOYMENT"] = OPTIMIZER_CONFIG.deployment
+    _reset_clients()

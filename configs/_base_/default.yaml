@@ -1,0 +1,208 @@
+# SkillOpt default configuration — base for all environments.
+# Environment configs should inherit via: _base_: default.yaml
+
+model:
+  # ── OpenAI-compatible API endpoints (shared defaults) ────────────────
+  backend: openai_compatible
+  optimizer_backend: openai_compatible
+  target_backend: openai_compatible
+
+  openai_compatible_base_url: 
+  openai_compatible_api_key: 
+
+  optimizer: ""
+  optimizer_openai_compatible_base_url: 
+  optimizer_openai_compatible_api_key: 
+ 
+  target: ""
+  target_openai_compatible_base_url: 
+  target_openai_compatible_api_key: 
+
+  # 在 azure_openai.py#L380-L412 中真正生效:作为 reasoning = {"effort": ...} (Responses API)或 
+  # reasoning_effort =...(Chat API)传给 API,控制 optimizer/target 所有 LLM 调用的思考量
+  reasoning_effort: medium
+
+  # - 只在 skill_update_mode: rewrite_from_suggestions 模式下使用: trainer.py#L864-L866 读取后
+  # (空串转 None ,键不存在时默认 high),专用于"根据建议全量重写 skill"这一次调用,传给 rewrite.py#L19 的 rewrite_skill_from_suggestions()
+  # 目的:全量重写需要更深思考
+  rewrite_reasoning_effort: ""
+
+  # ── Token limits (all explicit, no hidden defaults) ──────────────────
+  # Reflect / analyst phase (failure & success analysis → skill patches)
+  rewrite_max_completion_tokens: 64000
+  # Aggregate / merge / clip-ranking / lr-autonomous / slow-update / meta-skill
+  optimizer_max_completion_tokens: 32000
+  # Backend-level fallback (only used when a caller omits max_completion_tokens)
+  openai_compatible_max_tokens: 32000
+
+
+train:
+  num_epochs: 4
+  train_size: 0          # 0 = derive from dataset split when available
+  batch_size: 40
+  accumulation: 1
+  seed: 42
+
+
+gradient:
+  minibatch_size: 8
+  merge_batch_size: 8
+  analyst_workers: 16
+  max_analyst_rounds: 3
+  failure_only: false  # only use failures for skill update 只分析失败轨迹开关
+
+
+optimizer:
+  learning_rate: 4          # max edits per step (edit_budget)
+  min_learning_rate: 2      # min edits for decay schedulers
+  lr_scheduler: cosine      # constant / linear / cosine / autonomous
+  lr_control_mode: fixed    # fixed / autonomous / none
+  skill_update_mode: patch  # patch / rewrite_from_suggestions / full_rewrite_minibatch
+  use_slow_update: true
+  slow_update_samples: 20
+  slow_update_max_prompt_tokens: 200000   # 比较文本的 token 软上限; 超限时按重要性(improved→persistent_fail→regressed, 类内长轨迹优先)逐条剔除轨迹, metadata 永远保留; 0 = 关闭
+  slow_update_gate_with_selection: false
+  longitudinal_pair_policy: mixed  # mixed / changed / unchanged
+  use_meta_skill: true
+  use_skill_aware_reflection: false  # EmbodiSkill: split failures into SKILL_DEFECT (edit body) vs EXECUTION_LAPSE (protected appendix)
+  skill_aware_appendix_source: both  # both = success+failure emit appendix notes; failure_only = only EXECUTION_LAPSE (paper-faithful)
+  skill_aware_consolidate_threshold: 0  # 0 = off; >0 = LLM-consolidate the appendix when its note count exceeds N
+
+  # ── WikiSkill: persistent knowledge base (wiki_stage) ──────────────
+  # 在 Rollout 和 Reflect 之间插入 Wiki Maintainer, 将轨迹沉淀为持久知识库;
+  # wiki 跨所有迭代积累, skill 回滚时 wiki 保留; reflect 时注入 wiki 索引
+  use_wiki: true
+  wiki_max_patterns: 40           # pattern 数量上限, 超出时删除最旧的
+  wiki_sample_failures: 10        # Wiki Maintainer 每次采样的失败轨迹数
+  wiki_sample_successes: 5         # Wiki Maintainer 每次采样的成功轨迹数
+  wiki_max_completion_tokens: 32000  # Wiki Maintainer LLM 调用的 max_completion_tokens
+  wiki_max_traj_chars: 15000      # 单条轨迹最大字符数 (论文: 15000), 0 = 不截断
+  # ReAct Skill Proposer (论文 §3.2.3): Proposer 以 ReAct 方式按需 read_file
+  # 检索 wiki pattern 和原始轨迹, 而非全量注入; 需 use_wiki: true
+  wiki_react_proposer: true      # true = 用 ReAct Proposer 替代标准 reflect
+  wiki_react_max_iterations: 8   # ReAct 循环最大轮数 (即最多 read_file 8 次)
+
+  # ── SkillProx-style forward closed-loop gate (trainer.py ⑤.5) ──────
+  # 在同一训练批上重执行候选 skill,通过后才进入 selection 评估;未通过则回滚并重试
+  use_train_gate: false
+  train_gate_max_attempts: 3   # 每步总尝试次数(含首次), SkillProx 默认 3
+  train_gate_metric: hard      # hard / soft / mixed / and, 语义同 evaluation.gate_metric; and = 双指标都需保底
+  train_gate_mixed_weight: 0.5
+  train_gate_tolerance: -1      # 允许的指标降幅; 负数 = 自动(= scale × σ噪声, 每步从①的逐题结果算, 随 batch规模/任务难度自适应); 正数 = 固定值; 0.0 = 严格
+  train_gate_tolerance_scale: 1.5  # 自动容忍度缩放因子 k: tol = k·σ_diff; 1.5 → 零退化候选误拒率≈6.7%, 惜 attempt 预算可调大(2.0≈2.3%)
+
+  # ── SkillProx backward: 训练后近端收缩 (prox_shrink.py) ────────────
+  # 对 best_skill 做 单元分解 → leave-one-out 效用审计 → Shrinker 收缩 → 三重门控;
+  # 任一轮失败即终止(单遍有限终止); 通过则更新 best_skill 并影响最终 test 评估
+  use_prox_shrink: false
+  prox_max_trials: 3            # 最大收缩轮数
+  prox_max_compression: 0.10    # 累计压缩率软上限; 超限时需至少一项指标严格优于基线才放行(证据豁免)
+  prox_hard_tolerance: -1       # hard 验证地板容忍; 负数 = 自动(= scale × σ噪声, 随数据集/val规模自适应); 正数 = 固定值
+  prox_soft_tolerance: -1       # soft 验证地板容忍; 负数 = 自动; 正数 = 固定值
+  prox_tolerance_scale: 2.5     # 自动容忍度缩放因子 k: tol = k·σ_diff; 2.5 → 零退化trial被噪声误拒概率≈1.2%
+  prox_loo_env_num: 0           # LOO 效用审计样本数; 0 = 与 sel_env_num 相同(可调小省时)
+  
+  prox_adaptive_drill: true     # 两阶段LOO: 节级 |Δhard| 落在噪声门内(信号不明)的单元下钻为段落块重测
+  prox_noise_gate: -1           # 噪声门宽度; 负数 = 自动(= 0.5×σ_diff, n=200时≈0.02); 0 = 关闭下钻; 正数 = 固定值; 门宽>0.05时自动跳过下钻(块级效应必然低于节级, 测不出)
+  prox_sub_pack_chars: -1       # 下钻段落块最小打包字符数; 负数 = 自动(=clamp(单元长/6, 400, 2000), 每单元约4-6块, 随skill写作密度自适应, 换数据集免手调); 正数 = 固定值
+  prox_drill_budget: 6          # 每轮最多下钻评估的块总数(成本控制, 大单元优先)
+  
+  # ── Phase 2: GEPA 过程驱动反思 ───────────────────────────────────
+  # 接在 SkillOpt 训练 (Phase 1) 之后, Prox shrink (Phase 3) 之前
+  # GEPA 读取完整执行轨迹做步骤级因果分析, 突破结果驱动反思的上限
+  use_gepa: false               # 总开关; false = 跳过 GEPA 阶段
+  gepa_max_metric_calls: 100     # GEPA 评估预算(每次=1题rollout); 100-200 为推荐范围
+  gepa_reflection_lm: ""         # GEPA 反思模型; 空 = 复用 SkillOpt optimizer model
+  gepa_minibatch_size: 10        # 每次反思的 minibatch 大小(题目数)
+  gepa_run_dir: ""               # GEPA 状态目录; 空 = 自动到 out_root/gepa_phase/
+
+
+evaluation:
+  use_gate: true
+  gate_metric: hard        # hard / soft / mixed; mixed 用 gate_mixed_weight 加权
+  gate_mixed_weight: 0.5   # 仅 gate_metric=mixed 时生效
+  sel_env_num: 0
+  test_env_num: 0
+  eval_test: true
+
+
+env:
+  name: ""
+  skill_init: ""
+  split_mode: ratio       # ratio = build deterministic split from data_path; split_dir = use pre-split train/val/test
+  split_seed: 42
+  split_dir: ""
+  data_path: ""
+  split_output_dir: ""
+  exec_timeout: 120      # per target model/code-agent call timeout in seconds
+  out_root: ""
+
+
+
+
+
+
+  codex_exec_path: codex
+  codex_exec_sandbox: workspace-write
+  codex_exec_profile: ""
+  codex_exec_full_auto: false
+  codex_exec_reasoning_effort: none
+  codex_exec_use_sdk: auto
+  codex_exec_network_access: false
+  codex_exec_web_search: false
+  codex_exec_approval_policy: never
+  # 这个参数控制：当目标智能体(target)使用 Codex CLI 执行后端 时，是否把 Codex 的 执行轨迹摘要 
+  # 传回给优化器(optimizer)LLM,供其分析失败原因、生成 skill 补丁时参考。
+  codex_trace_to_optimizer: true
+
+
+  claude_code_exec_path: claude
+  claude_code_exec_profile: ""
+  claude_code_exec_use_sdk: auto
+  claude_code_exec_effort: medium
+  claude_code_exec_max_thinking_tokens: 16384
+
+  jiuwen_exec_provider: openai          # LLM provider for Jiuwen agent-core-rust backend
+  jiuwen_exec_api_key: ""               # blank = reuse target_openai_compatible_api_key
+  jiuwen_exec_api_base: ""              # blank = reuse target_openai_compatible_base_url
+  jiuwen_exec_verify_ssl: false
+  jiuwen_exec_max_iterations: 8         # max ReAct agent tool-call iterations
+  jiuwen_exec_empty_response_retries: 5  # retries when agent returns empty response
+
+
+  cursor_exec_path: ""       # blank uses CURSOR_EXEC_PATH or cursor-agent
+  cursor_exec_sandbox: ""    # blank uses CURSOR_EXEC_SANDBOX or enabled
+
+
+  azure_openai_endpoint: ""           # e.g. "https://your-resource.openai.azure.com/"
+  azure_openai_api_version: "2024-12-01-preview"
+  azure_openai_api_key: ""       # Fill locally if you do not export AZURE_OPENAI_API_KEY
+  azure_openai_auth_mode: ""           # empty → fall back to AZURE_OPENAI_AUTH_MODE env (default "azure_cli")
+  azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
+  azure_openai_managed_identity_client_id: ""
+
+
+  optimizer_azure_openai_endpoint: ""   # e.g. "https://your-resource.openai.azure.com/"
+  optimizer_azure_openai_api_version: "2024-12-01-preview"
+  optimizer_azure_openai_api_key: ""
+  optimizer_azure_openai_auth_mode: ""           # empty → fall back to OPTIMIZER_AZURE_OPENAI_AUTH_MODE env, then shared
+  optimizer_azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
+  optimizer_azure_openai_managed_identity_client_id: ""
+  target_azure_openai_endpoint: ""   # e.g. "https://your-resource.openai.azure.com/"
+  target_azure_openai_api_version: "2024-12-01-preview"
+  target_azure_openai_api_key: ""
+  target_azure_openai_auth_mode: ""           # empty → fall back to TARGET_AZURE_OPENAI_AUTH_MODE env, then shared
+  target_azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
+  target_azure_openai_managed_identity_client_id: ""
+
+  # MiniMax backend settings (minimax_chat target)
+  minimax_base_url: ""          # https://api.minimax.io/v1 if blank
+  minimax_api_key: ""
+  minimax_model: "MiniMax-M2.7"
+  minimax_temperature: "0.7"
+  minimax_max_tokens: "8000"
+  minimax_enable_thinking: "false"
+  optimizer_minimax_base_url: ""    # per-role override
+  target_minimax_base_url: ""       # per-role override
+  optimizer_minimax_api_key: ""
+  target_minimax_api_key: ""
